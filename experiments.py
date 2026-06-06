@@ -216,7 +216,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
 
-    net.to('cpu')
+    # model stays on GPU — removing .to('cpu') avoids a PCIe round-trip per client per round
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
@@ -290,7 +290,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
 
-    net.to('cpu')
+    # model stays on GPU — removing .to('cpu') avoids a PCIe round-trip per client per round
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
@@ -372,7 +372,7 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
 
-    net.to('cpu')
+    # model stays on GPU — removing .to('cpu') avoids a PCIe round-trip per client per round
     logger.info(' ** Training complete **')
     return train_acc, test_acc, c_delta_para
 
@@ -438,7 +438,7 @@ def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataload
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
 
-    net.to('cpu')
+    # model stays on GPU — removing .to('cpu') avoids a PCIe round-trip per client per round
     logger.info(' ** Training complete **')
     return train_acc, test_acc, a_i, norm_grad
 
@@ -541,15 +541,12 @@ def train_net_moon(net_id, net, global_net, previous_nets, train_dataloader, tes
         logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
 
 
-    if args.loss != 'l2norm':
-        for previous_net in previous_nets:
-            previous_net.to('cpu')
+    # previous_nets and current net stay on GPU — removing .to('cpu') avoids PCIe round-trips
     train_acc = compute_accuracy(net, train_dataloader, moon_model=True, device=device)
     test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, moon_model=True, device=device)
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
-    net.to('cpu')
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
@@ -561,7 +558,7 @@ def view_image(train_dataloader):
         exit(0)
 
 
-def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net(nets, selected, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
 
     for net_id, net in nets.items():
@@ -570,19 +567,20 @@ def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, devic
         dataidxs = net_dataidx_map[net_id]
 
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
-        # move the model to cuda device:
         net.to(device)
 
-        noise_level = args.noise
-        if net_id == args.n_parties - 1:
-            noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
         n_epoch = args.epochs
 
 
@@ -601,7 +599,7 @@ def local_train_net(nets, selected, args, net_dataidx_map, test_dl = None, devic
     return nets_list
 
 
-def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
 
     for net_id, net in nets.items():
@@ -610,19 +608,20 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map,
         dataidxs = net_dataidx_map[net_id]
 
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
-        # move the model to cuda device:
         net.to(device)
 
-        noise_level = args.noise
-        if net_id == args.n_parties - 1:
-            noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
         n_epoch = args.epochs
 
         trainacc, testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args.mu, device=device)
@@ -635,7 +634,7 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map,
     nets_list = list(nets.values())
     return nets_list
 
-def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
 
     total_delta = copy.deepcopy(global_model.state_dict())
@@ -649,27 +648,26 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
         dataidxs = net_dataidx_map[net_id]
 
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
-        # move the model to cuda device:
         net.to(device)
-
         c_nets[net_id].to(device)
 
-        noise_level = args.noise
-        if net_id == args.n_parties - 1:
-            noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
         n_epoch = args.epochs
-
 
         trainacc, testacc, c_delta_para = train_net_scaffold(net_id, net, global_model, c_nets[net_id], c_global, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, device=device)
 
-        c_nets[net_id].to('cpu')
+        # c_net stays on GPU — removing .to('cpu') avoids a PCIe round-trip per client per round
         for key in total_delta:
             total_delta[key] += c_delta_para[key]
 
@@ -696,7 +694,7 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
     nets_list = list(nets.values())
     return nets_list
 
-def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl = None, device="cpu"):
+def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
 
     a_list = []
@@ -709,19 +707,20 @@ def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map,
         dataidxs = net_dataidx_map[net_id]
 
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
-        # move the model to cuda device:
         net.to(device)
 
-        noise_level = args.noise
-        if net_id == args.n_parties - 1:
-            noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
         n_epoch = args.epochs
 
 
@@ -742,7 +741,7 @@ def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map,
     nets_list = list(nets.values())
     return nets_list, a_list, d_list, n_list
 
-def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, global_model = None, prev_model_pool = None, round=None, device="cpu"):
+def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, global_model=None, prev_model_pool=None, round=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
     global_model.to(device)
     for net_id, net in nets.items():
@@ -753,16 +752,18 @@ def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, gl
         logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         net.to(device)
 
-        noise_level = args.noise
-        if net_id == args.n_parties - 1:
-            noise_level = 0
-
-        if args.noise_type == 'space':
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            noise_level = args.noise / (args.n_parties - 1) * net_id
-            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
-        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
         n_epoch = args.epochs
 
         prev_models=[]
@@ -776,7 +777,7 @@ def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, gl
     avg_acc /= len(selected)
     if args.alg == 'local_training':
         logger.info("avg test acc %f" % avg_acc)
-    global_model.to('cpu')
+    # global_model stays on GPU — removing .to('cpu') avoids a PCIe round-trip per round
     nets_list = list(nets.values())
     return nets_list
 
@@ -840,10 +841,26 @@ if __name__ == '__main__':
 
     print("len train_dl_global:", len(train_ds_global))
 
-
     data_size = len(test_ds_global)
 
-    # test_dl = data.DataLoader(dataset=test_ds_global, batch_size=32, shuffle=False)
+    # Pre-load the full test set into GPU memory once — all eval passes reuse these tensors
+    # with zero PCIe transfers (x.to(device) in compute_accuracy becomes a no-op)
+    test_dl_global = build_gpu_test_loader(args.dataset, args.datadir, 32, device)
+
+    # Pre-build one DataLoader per client — created once, reused every communication round
+    # This eliminates n_parties * comm_round DataLoader instantiations (500+ for this run)
+    client_train_loaders = {}
+    for net_id in range(args.n_parties):
+        dataidxs = net_dataidx_map[net_id]
+        noise_level = args.noise
+        if net_id == args.n_parties - 1:
+            noise_level = 0
+        if args.noise_type == 'space':
+            dl, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        else:
+            noise_level = args.noise / (args.n_parties - 1) * net_id
+            dl, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+        client_train_loaders[net_id] = dl
 
     train_all_in_list = []
     test_all_in_list = []
@@ -896,15 +913,15 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
-            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+            local_train_net(nets, selected, args, net_dataidx_map, test_dl=test_dl_global, device=device, train_dl_cache=client_train_loaders)
 
-            # update global model
+            # aggregate on GPU — .state_dict() keeps tensors on their current device,
+            # so no .cpu() call needed and arithmetic stays on the GPU
             total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
 
             for idx in range(len(selected)):
-                net_para = nets[selected[idx]].cpu().state_dict()
+                net_para = nets[selected[idx]].state_dict()
                 if idx == 0:
                     for key in net_para:
                         global_para[key] = net_para[key] * fed_avg_freqs[idx]
@@ -916,10 +933,9 @@ if __name__ == '__main__':
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
 
-            global_model.to(device)
+            # global_model already on GPU — .to(device) removed
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
-
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
@@ -953,15 +969,16 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl = test_dl_global, device=device)
-            global_model.to('cpu')
+            local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map, test_dl=test_dl_global, device=device, train_dl_cache=client_train_loaders)
+            # global_model stays on GPU — removed .to('cpu') that was placed here before aggregation
 
-            # update global model
+            # aggregate on GPU — .state_dict() keeps tensors on their current device,
+            # so no .cpu() call needed and arithmetic stays on the GPU
             total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
 
             for idx in range(len(selected)):
-                net_para = nets[selected[idx]].cpu().state_dict()
+                net_para = nets[selected[idx]].state_dict()
                 if idx == 0:
                     for key in net_para:
                         global_para[key] = net_para[key] * fed_avg_freqs[idx]
@@ -970,15 +987,12 @@ if __name__ == '__main__':
                         global_para[key] += net_para[key] * fed_avg_freqs[idx]
             global_model.load_state_dict(global_para)
 
-
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
 
-
-            global_model.to(device)
+            # global_model already on GPU — .to(device) removed
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
-
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
@@ -1018,15 +1032,15 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, net_dataidx_map, test_dl = test_dl_global, device=device)
-            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+            local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, args, net_dataidx_map, test_dl=test_dl_global, device=device, train_dl_cache=client_train_loaders)
 
-            # update global model
+            # aggregate on GPU — .state_dict() keeps tensors on their current device,
+            # so no .cpu() call needed and arithmetic stays on the GPU
             total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
 
             for idx in range(len(selected)):
-                net_para = nets[selected[idx]].cpu().state_dict()
+                net_para = nets[selected[idx]].state_dict()
                 if idx == 0:
                     for key in net_para:
                         global_para[key] = net_para[key] * fed_avg_freqs[idx]
@@ -1035,11 +1049,10 @@ if __name__ == '__main__':
                         global_para[key] += net_para[key] * fed_avg_freqs[idx]
             global_model.load_state_dict(global_para)
 
-
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
 
-            global_model.to(device)
+            # global_model already on GPU — .to(device) removed
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
 
@@ -1088,9 +1101,9 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            _, a_list, d_list, n_list = local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            _, a_list, d_list, n_list = local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl=test_dl_global, device=device, train_dl_cache=client_train_loaders)
             total_n = sum(n_list)
-            #print("total_n:", total_n)
+            # d_total_round stays on GPU — state_dict tensors are on the same device as global_model
             d_total_round = copy.deepcopy(global_model.state_dict())
             for key in d_total_round:
                 d_total_round[key] = 0.0
@@ -1098,43 +1111,29 @@ if __name__ == '__main__':
             for i in range(len(selected)):
                 d_para = d_list[i]
                 for key in d_para:
-                    #if d_total_round[key].type == 'torch.LongTensor':
-                    #    d_total_round[key] += (d_para[key] * n_list[i] / total_n).type(torch.LongTensor)
-                    #else:
                     d_total_round[key] += d_para[key] * n_list[i] / total_n
 
-
-            # for i in range(len(selected)):
-            #     d_total_round = d_total_round + d_list[i] * n_list[i] / total_n
-
-            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
-
-            # update global model
+            # update global model — all arithmetic on GPU
             coeff = 0.0
             for i in range(len(selected)):
                 coeff = coeff + a_list[i] * n_list[i]/total_n
 
             updated_model = global_model.state_dict()
             for key in updated_model:
-                #print(updated_model[key])
                 if updated_model[key].type() == 'torch.LongTensor':
                     updated_model[key] -= (coeff * d_total_round[key]).type(torch.LongTensor)
                 elif updated_model[key].type() == 'torch.cuda.LongTensor':
                     updated_model[key] -= (coeff * d_total_round[key]).type(torch.cuda.LongTensor)
                 else:
-                    #print(updated_model[key].type())
-                    #print((coeff*d_total_round[key].type()))
                     updated_model[key] -= coeff * d_total_round[key]
             global_model.load_state_dict(updated_model)
-
 
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
 
-            global_model.to(device)
+            # global_model already on GPU — .to(device) removed
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
-
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
@@ -1173,16 +1172,16 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, global_model=global_model,
-                                 prev_model_pool=old_nets_pool, round=round, device=device)
-            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+            local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=test_dl_global, global_model=global_model,
+                                 prev_model_pool=old_nets_pool, round=round, device=device, train_dl_cache=client_train_loaders)
 
-            # update global model
+            # aggregate on GPU — .state_dict() keeps tensors on their current device,
+            # so no .cpu() call needed and arithmetic stays on the GPU
             total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
 
             for idx in range(len(selected)):
-                net_para = nets[selected[idx]].cpu().state_dict()
+                net_para = nets[selected[idx]].state_dict()
                 if idx == 0:
                     for key in net_para:
                         global_para[key] = net_para[key] * fed_avg_freqs[idx]
@@ -1194,10 +1193,9 @@ if __name__ == '__main__':
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
 
-            global_model.to(device)
+            # global_model already on GPU — .to(device) removed
             train_acc = compute_accuracy(global_model, train_dl_global, moon_model=True, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, moon_model=True, device=device)
-
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
@@ -1216,7 +1214,7 @@ if __name__ == '__main__':
         logger.info("Initializing nets")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
         arr = np.arange(args.n_parties)
-        local_train_net(nets, arr, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+        local_train_net(nets, arr, args, net_dataidx_map, test_dl=test_dl_global, device=device, train_dl_cache=client_train_loaders)
 
     elif args.alg == 'all_in':
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, 1, args)

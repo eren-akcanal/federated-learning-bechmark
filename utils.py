@@ -584,7 +584,8 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, moon_model=F
         model.eval()
         was_training = True
 
-    true_labels_list, pred_labels_list = np.array([]), np.array([])
+    # lists avoid the O(n²) reallocation that np.append causes per batch
+    true_labels_list, pred_labels_list = [], []
 
     if type(dataloader) == type([1]):
         pass
@@ -595,6 +596,7 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, moon_model=F
     with torch.no_grad():
         for tmp in dataloader:
             for batch_idx, (x, target) in enumerate(tmp):
+                # if data is already on device (GPU TensorDataset), .to(device) is a no-op
                 x, target = x.to(device), target.to(device,dtype=torch.int64)
                 if moon_model:
                     _, _, out = model(x)
@@ -605,15 +607,16 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, moon_model=F
                 total += x.data.size()[0]
                 correct += (pred_label == target.data).sum().item()
 
-                if device == "cpu":
-                    pred_labels_list = np.append(pred_labels_list, pred_label.numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.numpy())
-                else:
-                    pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
+                if get_confusion_matrix:
+                    # only pay the GPU→CPU transfer cost when the confusion matrix is actually needed
+                    pred_labels_list.append(pred_label.cpu().numpy())
+                    true_labels_list.append(target.data.cpu().numpy())
 
     if get_confusion_matrix:
-        conf_matrix = confusion_matrix(true_labels_list, pred_labels_list)
+        conf_matrix = confusion_matrix(
+            np.concatenate(true_labels_list),
+            np.concatenate(pred_labels_list)
+        )
 
     if was_training:
         model.train()
@@ -776,10 +779,33 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
             test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
 
-        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=False)
-        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=False)
+        # num_workers=4: async CPU prefetch overlaps data loading with GPU compute
+        # pin_memory=True: DMA-pinned staging buffer for faster PCIe transfers
+        # persistent_workers=True: keeps worker processes alive between iterations
+        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=False,
+                                   num_workers=4, pin_memory=True, persistent_workers=True)
+        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=False,
+                                  num_workers=4, pin_memory=True, persistent_workers=True)
 
     return train_dl, test_dl, train_ds, test_ds
+
+
+def build_gpu_test_loader(dataset, datadir, test_bs, device):
+    """Pre-load the full test set into GPU memory once at startup.
+
+    Every subsequent call to compute_accuracy on this loader costs zero PCIe
+    transfers — the tensors are already resident on the GPU.
+    num_workers=0 is intentional: CUDA tensors cannot be shared across
+    DataLoader worker processes."""
+    _, test_dl_cpu, _, _ = get_dataloader(dataset, datadir, test_bs, test_bs)
+    xs, ys = [], []
+    for x, y in test_dl_cpu:
+        xs.append(x)
+        ys.append(y)
+    X_test = torch.cat(xs, dim=0).to(device)
+    y_test = torch.cat(ys, dim=0).to(device)
+    gpu_ds = data.TensorDataset(X_test, y_test)
+    return data.DataLoader(gpu_ds, batch_size=test_bs, shuffle=False, num_workers=0)
 
 
 def weights_init(m):
