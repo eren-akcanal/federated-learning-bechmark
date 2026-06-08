@@ -70,11 +70,34 @@ python experiments.py --model=simple-cnn \
     --init_seed=0
 ```
 
+FedPAC variants can be run through the same benchmark entry point. For example:
+```
+python experiments.py --model=simple-cnn \
+    --dataset=cifar10 \
+    --alg=fedsoap \
+    --lr=0.003 \
+    --batch-size=64 \
+    --epochs=5 \
+    --fedpac-k=50 \
+    --fedpac-alpha=0.5 \
+    --n_parties=10 \
+    --comm_round=50 \
+    --partition=noniid-labeldir \
+    --beta=0.5 \
+    --device='cuda:0' \
+    --datadir='./data/' \
+    --logdir='./logs/' \
+    --sample=1 \
+    --init_seed=0
+```
+
+Use `--alg=fedmuon` for the Muon-backed variant. `--alg=fedsophia` is also wired in, but it requires the `SophiaG` optimizer module (`sophia.py`) to be present in `FedPAC-8B24` or installed in the environment.
+
 | Parameter                      | Description                                 |
 | ----------------------------- | ---------------------------------------- |
 | `model` | The model architecture. Options: `simple-cnn`, `vgg`, `resnet`, `mlp`. Default = `mlp`. |
 | `dataset`      | Dataset to use. Options: `mnist`, `cifar10`, `fmnist`, `svhn`, `generated`, `femnist`, `a9a`, `rcv1`, `covtype`. Default = `mnist`. |
-| `alg` | The training algorithm. Options: `fedavg`, `fedprox`, `scaffold`, `fednova`, `moon`. Default = `fedavg`. |
+| `alg` | The training algorithm. Options: `fedavg`, `fedprox`, `scaffold`, `fednova`, `moon`, `fedsoap`, `fedmuon`, `fedsophia`. Default = `fedavg`. |
 | `lr` | Learning rate for the local models, default = `0.01`. |
 | `batch-size` | Batch size, default = `64`. |
 | `epochs` | Number of local training epochs, default = `5`. |
@@ -90,6 +113,10 @@ python experiments.py --model=simple-cnn \
 | `noise` | Maximum variance of Gaussian noise we add to local party, default = `0`. |
 | `sample` | Ratio of parties that participate in each communication round, default = `1`. |
 | `init_seed` | The initial seed, default = `0`. |
+| `fedpac-alpha` | FedPAC correction strength used for `fedsoap`, `fedmuon`, and `fedsophia`, default = `0.5`. |
+| `fedpac-k` | Maximum local optimizer steps per selected FedPAC client; `0` uses all batches from `epochs`, default = `0`. |
+| `fedpac-soap-precondition-frequency` | SOAP preconditioner update frequency for `fedsoap`, default = `10`. |
+| `fedpac-muon-scale` | Learning-rate multiplier for Muon matrix parameters for `fedmuon`, default = `1.0`. |
 
 
 

@@ -11,6 +11,7 @@ import argparse
 import logging
 import os
 import copy
+import sys
 from math import *
 import random
 
@@ -21,6 +22,10 @@ from model import *
 from utils import *
 from vggmodel import *
 from resnetcifar import *
+
+FEDPAC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FedPAC-8B24")
+if FEDPAC_DIR not in sys.path:
+    sys.path.insert(0, FEDPAC_DIR)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -33,7 +38,7 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=2,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
-                            help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon')
+                            help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon/fedsoap/fedmuon/fedsophia')
     parser.add_argument('--use_projection_head', type=bool, default=False, help='whether add an additional header to model or not (see MOON)')
     parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
     parser.add_argument('--loss', type=str, default='contrastive', help='for moon')
@@ -55,6 +60,14 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--fedpac-alpha', type=float, default=0.5,
+                        help='FedPAC correction strength for the global update direction')
+    parser.add_argument('--fedpac-k', type=int, default=0,
+                        help='Maximum local optimizer steps for FedPAC clients; 0 uses full local epochs')
+    parser.add_argument('--fedpac-soap-precondition-frequency', type=int, default=10,
+                        help='How often SOAP updates its preconditioner in FedPAC')
+    parser.add_argument('--fedpac-muon-scale', type=float, default=1.0,
+                        help='Learning-rate multiplier for Muon matrix parameters in FedPAC')
     args = parser.parse_args()
     return args
 
@@ -783,6 +796,245 @@ def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, gl
 
 
 
+def _clone_fedpac_state(value, device=None):
+    if isinstance(value, torch.Tensor):
+        cloned = value.detach().clone()
+        return cloned.to(device) if device is not None else cloned
+    if isinstance(value, list):
+        return [_clone_fedpac_state(item, device=device) for item in value]
+    return copy.deepcopy(value)
+
+
+def _add_scaled_fedpac_state(acc, value, scale):
+    if isinstance(value, torch.Tensor):
+        term = value.detach().clone() * scale
+        return term if acc is None else acc + term
+    if isinstance(value, list):
+        if acc is None:
+            acc = [None for _ in value]
+        return [_add_scaled_fedpac_state(acc_item, value_item, scale)
+                for acc_item, value_item in zip(acc, value)]
+    return copy.deepcopy(value)
+
+
+def _fedpac_optimizer(alg, net, args):
+    alg = alg.lower()
+    if alg == 'fedsoap':
+        from soap import SOAP
+        return SOAP(
+            params=filter(lambda p: p.requires_grad, net.parameters()),
+            lr=args.lr,
+            betas=(0.95, 0.95),
+            shampoo_beta=0.95,
+            weight_decay=args.reg,
+            precondition_frequency=args.fedpac_soap_precondition_frequency,
+        )
+    if alg == 'fedmuon':
+        from muon import SingleDeviceMuonWithAuxAdam
+        hidden_weights = [p for p in net.parameters() if p.requires_grad and p.ndim >= 2]
+        aux_params = [p for p in net.parameters() if p.requires_grad and p.ndim < 2]
+        param_groups = []
+        if hidden_weights:
+            param_groups.append(dict(
+                params=hidden_weights,
+                use_muon=True,
+                lr=args.lr * args.fedpac_muon_scale,
+                weight_decay=args.reg,
+                momentum=0.95,
+            ))
+        if aux_params:
+            param_groups.append(dict(
+                params=aux_params,
+                use_muon=False,
+                lr=args.lr,
+                betas=(0.9, 0.95),
+                weight_decay=args.reg,
+            ))
+        return SingleDeviceMuonWithAuxAdam(param_groups)
+    if alg == 'fedsophia':
+        try:
+            from sophia import SophiaG
+        except ImportError as exc:
+            raise ImportError(
+                "FedSophia requires FedPAC-8B24/sophia.py or an installed sophia module; "
+                "this checkout does not include it. Use --alg fedsoap or --alg fedmuon, "
+                "or add SophiaG to FedPAC-8B24."
+            ) from exc
+        return SophiaG(net.parameters(), lr=args.lr, betas=(0.9, 0.99), rho=args.rho or 0.01,
+                       weight_decay=args.reg)
+    raise ValueError('Unsupported FedPAC algorithm: {}'.format(alg))
+
+
+def _load_fedpac_shared_state(optimizer, net, shared_preconditioner, alg, device):
+    if not shared_preconditioner:
+        return
+    for name, param in net.named_parameters():
+        if name not in shared_preconditioner:
+            continue
+        state = optimizer.state[param]
+        if alg == 'fedsoap':
+            state['GG'] = _clone_fedpac_state(shared_preconditioner[name], device=device)
+        elif alg == 'fedmuon' and param.ndim >= 2:
+            state['momentum_buffer'] = _clone_fedpac_state(shared_preconditioner[name], device=device)
+        elif alg == 'fedsophia':
+            state['hessian'] = _clone_fedpac_state(shared_preconditioner[name], device=device)
+
+
+def _collect_fedpac_shared_state(optimizer, net, alg):
+    collected = {}
+    for name, param in net.named_parameters():
+        state = optimizer.state.get(param, None)
+        if not state:
+            continue
+        if alg == 'fedsoap' and 'GG' in state:
+            collected[name] = _clone_fedpac_state(state['GG'])
+        elif alg == 'fedmuon' and param.ndim >= 2 and 'momentum_buffer' in state:
+            collected[name] = _clone_fedpac_state(state['momentum_buffer'])
+        elif alg == 'fedsophia' and 'hessian' in state:
+            collected[name] = _clone_fedpac_state(state['hessian'])
+    return collected
+
+
+def train_net_fedpac(net_id, net, train_dataloader, test_dataloader, epochs, args,
+                     shared_direction=None, shared_preconditioner=None, device='cpu'):
+    alg = args.alg.lower()
+    logger.info('Training FedPAC network %s with %s' % (str(net_id), alg))
+
+    optimizer = _fedpac_optimizer(alg, net, args)
+    _load_fedpac_shared_state(optimizer, net, shared_preconditioner, alg, device)
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    if type(train_dataloader) == type([1]):
+        train_loaders = train_dataloader
+    else:
+        train_loaders = [train_dataloader]
+
+    max_steps = args.fedpac_k if args.fedpac_k and args.fedpac_k > 0 else None
+    expected_steps = max_steps or max(1, sum(len(dl) for dl in train_loaders) * epochs)
+    step_count = 0
+
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        stop_training = False
+        for tmp in train_loaders:
+            for batch_idx, (x, target) in enumerate(tmp):
+                if max_steps is not None and step_count >= max_steps:
+                    stop_training = True
+                    break
+                x, target = x.to(device), target.to(device)
+                target = target.long()
+
+                optimizer.zero_grad()
+                out = net(x)
+                loss = criterion(out, target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=net.parameters(), max_norm=10)
+
+                if alg == 'fedsophia' and hasattr(optimizer, 'update_hessian'):
+                    optimizer.update_hessian()
+                if alg == 'fedsophia':
+                    try:
+                        optimizer.step(bs=args.batch_size)
+                    except TypeError:
+                        optimizer.step()
+                else:
+                    optimizer.step()
+
+                if shared_direction:
+                    with torch.no_grad():
+                        for name, param in net.named_parameters():
+                            if param.requires_grad and name in shared_direction and torch.is_floating_point(param):
+                                correction = shared_direction[name].to(device)
+                                param.add_(correction, alpha=args.fedpac_alpha * args.lr / expected_steps)
+
+                step_count += 1
+                epoch_loss_collector.append(loss.item())
+            if stop_training:
+                break
+
+        if epoch_loss_collector:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+            logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        if stop_training:
+            break
+
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    logger.info('>> Training accuracy: %f' % train_acc)
+    logger.info('>> Test accuracy: %f' % test_acc)
+    return train_acc, test_acc, _collect_fedpac_shared_state(optimizer, net, alg)
+
+
+def local_train_net_fedpac(nets, selected, args, net_dataidx_map, test_dl=None, device='cpu',
+                           train_dl_cache=None, shared_direction=None, shared_preconditioner=None):
+    avg_acc = 0.0
+    client_preconditioners = {}
+    for net_id, net in nets.items():
+        if net_id not in selected:
+            continue
+        dataidxs = net_dataidx_map[net_id]
+        logger.info('Training network %s. n_training: %d' % (str(net_id), len(dataidxs)))
+        net.to(device)
+
+        if train_dl_cache is not None:
+            train_dl_local = train_dl_cache[net_id]
+        else:
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+
+        trainacc, testacc, preconditioner = train_net_fedpac(
+            net_id, net, train_dl_local, test_dl, args.epochs, args,
+            shared_direction=shared_direction,
+            shared_preconditioner=shared_preconditioner,
+            device=device,
+        )
+        client_preconditioners[net_id] = preconditioner
+        logger.info('net %d final test acc %f' % (net_id, testacc))
+        avg_acc += testacc
+
+    avg_acc /= len(selected)
+    return list(nets.values()), client_preconditioners
+
+
+def aggregate_fedpac_round(global_model, nets, selected, net_dataidx_map, client_preconditioners, args):
+    global_para = global_model.state_dict()
+    old_global_para = {k: v.detach().clone() for k, v in global_para.items()}
+    total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
+    fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+
+    for idx, net_id in enumerate(selected):
+        net_para = nets[net_id].state_dict()
+        for key in net_para:
+            if not torch.is_floating_point(global_para[key]):
+                if idx == 0:
+                    global_para[key] = net_para[key].detach().clone()
+                continue
+            if idx == 0:
+                global_para[key] = net_para[key] * fed_avg_freqs[idx]
+            else:
+                global_para[key] += net_para[key] * fed_avg_freqs[idx]
+    global_model.load_state_dict(global_para)
+
+    shared_direction = {}
+    for key, value in global_para.items():
+        if torch.is_floating_point(value):
+            shared_direction[key] = (value.detach().clone() - old_global_para[key]) / args.lr
+
+    shared_preconditioner = {}
+    for freq, net_id in zip(fed_avg_freqs, selected):
+        for key, value in client_preconditioners.get(net_id, {}).items():
+            shared_preconditioner[key] = _add_scaled_fedpac_state(
+                shared_preconditioner.get(key), value, freq)
+
+    return shared_direction, shared_preconditioner
+
+
 def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./data', logdir='./logs', beta=0.5):
     seed = init_seed
     np.random.seed(seed)
@@ -1209,6 +1461,61 @@ if __name__ == '__main__':
                 old_nets_pool.append(old_nets)
             else:
                 old_nets_pool[0] = old_nets
+
+
+    elif args.alg.lower() in {'fedsoap', 'fedmuon', 'fedsophia'}:
+        args.alg = args.alg.lower()
+        logger.info("Initializing nets")
+        nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
+        global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
+        global_model = global_models[0]
+        global_model.to(device)
+
+        global_para = global_model.state_dict()
+        if args.is_same_initial:
+            for net_id, net in nets.items():
+                net.load_state_dict(global_para)
+
+        shared_direction = None
+        shared_preconditioner = None
+
+        for round in range(args.comm_round):
+            logger.info("in comm round:" + str(round))
+
+            arr = np.arange(args.n_parties)
+            np.random.shuffle(arr)
+            selected = arr[:int(args.n_parties * args.sample)]
+
+            global_para = global_model.state_dict()
+            if round == 0:
+                if args.is_same_initial:
+                    for idx in selected:
+                        nets[idx].load_state_dict(global_para)
+            else:
+                for idx in selected:
+                    nets[idx].load_state_dict(global_para)
+
+            _, client_preconditioners = local_train_net_fedpac(
+                nets, selected, args, net_dataidx_map,
+                test_dl=test_dl_global,
+                device=device,
+                train_dl_cache=client_train_loaders,
+                shared_direction=shared_direction,
+                shared_preconditioner=shared_preconditioner,
+            )
+
+            shared_direction, shared_preconditioner = aggregate_fedpac_round(
+                global_model, nets, selected, net_dataidx_map, client_preconditioners, args)
+
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl_global))
+
+            train_acc = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
 
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
