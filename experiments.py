@@ -30,6 +30,7 @@ def get_args():
     parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
+    parser.add_argument('--lg', default=0.1, type=float, help='learning rate')
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=2,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
@@ -55,8 +56,25 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--K', default=10, type=int, help='#workers')
     args = parser.parse_args()
     return args
+
+def _flatten_for_svd(x: torch.Tensor):
+    """muon 风格展平：4D conv -> [out, -1]；2D 保持；其他 >=3D -> [dim0, -1]。"""
+    orig_shape = tuple(x.shape)
+    if x.ndim == 2:
+        mat = x
+    elif x.ndim == 4:
+        mat = x.reshape(orig_shape[0], -1)
+    else:  # 兼容 3D/5D 等少见情况
+        mat = x.reshape(orig_shape[0], -1)
+    return mat, orig_shape
+
+def _unflatten_from_svd(mat2d: torch.Tensor, orig_shape: tuple):
+    """按保存的原形状还原（展平规则都是 [dim0, -1]，因此直接 reshape 回去即可）。"""
+    return mat2d.reshape(orig_shape)
+
 
 def init_nets(net_configs, dropout_p, n_parties, args):
 
@@ -694,6 +712,76 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
     nets_list = list(nets.values())
     return nets_list
 
+def local_train_net_fedmuon(nets, selected, args, device="cpu", train_dl_cache=None):
+    """
+    Sequentially trains selected local models and returns weight changes (delta_w).
+    Matches the pattern used by FedNova's local training handler.
+    """
+    delta_list = []
+    criterion = torch.nn.CrossEntropyLoss()
+
+    for idx in selected:
+        model = nets[idx]
+        model.to(device)
+        
+        # Ensure head parameters are explicit training targets
+        for name, param in model.named_parameters():
+            if "classifier" in name or "head" in name:
+                param.requires_grad = True
+
+        # Track the starting weights of the round to isolate delta paths later
+        starting_weights = copy.deepcopy(model.state_dict())
+        
+        # Pull specific DataLoader for this target node
+        train_dataloader = train_dl_cache[idx]
+        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=1e-3)
+        
+        step = 0
+        local_loss = 0.0
+        model.train()
+
+        # Run local optimization iterations
+        for e in range(args.epochs):
+            for batch_idx, (data, target) in enumerate(train_dataloader):
+                if step >= args.K:
+                    break
+                step += 1
+                
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                local_loss += loss.item() / args.K
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=10)
+                optimizer.step()
+            if step >= args.K:
+                break
+
+        # Calculate weight updates: delta_w = w_t_local - w_t_global
+        current_weights = model.state_dict()
+        delta_w = {}
+        
+        if hasattr(args, 'lora') and args.lora == 1:
+            for k, v in current_weights.items():
+                if 'lora' in k or "classifier" in k or "head" in k:
+                    delta_w[k] = v.detach().cpu() - starting_weights[k].cpu()
+        else:
+            for k, v in current_weights.items():
+                delta_w[k] = v.detach().cpu() - starting_weights[k].cpu()
+
+        # Compute trace updates metrics
+        norm = sum(torch.norm(delta_w[k], p=2) for k in delta_w).item()
+        logger.info(f"Client {idx} -> Steps: {step} | Update Norm: {norm:.4f} | Local Avg Loss: {local_loss:.4f}")
+        
+        delta_list.append(delta_w)
+        
+        # Push model back to cpu memory to safely handle footprints
+        model.to("cpu")
+        
+    return delta_list
+
 def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
 
@@ -1053,6 +1141,76 @@ if __name__ == '__main__':
             logger.info('global n_test: %d' % len(test_dl_global))
 
             # global_model already on GPU — .to(device) removed
+            train_acc = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
+    elif args.alg == 'fedmuon':
+        logger.info("Initializing nets for FedMuon")
+        nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
+        global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
+        global_model = global_models[0]
+
+        # Sync initial weights if selected
+        global_para = global_model.state_dict()
+        if args.is_same_initial:
+            for net_id, net in nets.items():
+                net.load_state_dict(global_para)
+
+        # Loop over communication rounds
+        for round in range(args.comm_round):
+            logger.info("in comm round:" + str(round))
+
+            arr = np.arange(args.n_parties)
+            np.random.shuffle(arr)
+            selected = arr[:int(args.n_parties * args.sample)]
+
+            # Broadcast global weights to chosen participants
+            global_para = global_model.state_dict()
+            for idx in selected:
+                nets[idx].load_state_dict(global_para)
+
+            # --- Local Training Phase (Sequential Local Loop) ---
+            # This calls the custom local training function designed below
+            delta_list = local_train_net_fedmuon(nets, selected, args, device=device, train_dl_cache=client_train_loaders)
+
+            # --- Server Aggregation & Muon SVD Treatment ---
+            updated_model = global_model.state_dict()
+            
+            # 1. Accumulate averaged raw pseudo-gradients (delta_w) across clients
+            avg_delta = {key: torch.zeros_like(updated_model[key], dtype=torch.float32, device=device) for key in updated_model}
+            
+            for delta_w in delta_list:
+                for key in delta_w:
+                    avg_delta[key] += delta_w[key].to(device) / len(selected)
+
+            # 2. Apply Server-Side Muon Orthogonalization
+            with torch.no_grad():
+                for key in updated_model.keys():
+                    target_device = updated_model[key].device
+                    
+                    if avg_delta[key].ndim in [2, 4] and "weight" in key:
+                        mat, orig_shape = _flatten_for_svd(avg_delta[key])
+                        
+                        try:
+                            # Singular Value Decomposition: mat = U * S * V^T
+                            U, S, Vt = torch.linalg.svd(mat, full_matrices=False)
+                            ortho_mat = U @ Vt
+                            ortho_delta = _unflatten_from_svd(ortho_mat, orig_shape)
+                            
+                            updated_model[key] += args.lg * ortho_delta.to(target_device)
+                        except RuntimeError:
+                            updated_model[key] += args.lg * avg_delta[key].to(target_device)
+                    else:
+                        updated_model[key] += args.lg * avg_delta[key].to(target_device)
+
+            global_model.load_state_dict(updated_model)
+            global_model.to(device)
+            
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl_global))
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
 
