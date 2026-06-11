@@ -35,7 +35,7 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=2,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
-                            help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon')
+                            help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon/fedmuon/fedadamw')
     parser.add_argument('--use_projection_head', type=bool, default=False, help='whether add an additional header to model or not (see MOON)')
     parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
     parser.add_argument('--loss', type=str, default='contrastive', help='for moon')
@@ -589,11 +589,11 @@ def train_net_adamw(net_id, net, global_net, train_dataloader, test_dataloader, 
             param_name = get_param_name(net, p)
             state = optimizer.state.get(p, None)
             if state is not None and 'exp_avg_sq' in state:
-                momen_v[param_name] = state['exp_avg_sq'].clone().detach().to('cpu')
+                momen_v[param_name] = state['exp_avg_sq'].clone().detach()
 
-    delta_w = {k: v.cpu() for k, v in net.state_dict().items()}
-    for k, v in net.state_dict().items():
-        delta_w[k] = v.cpu() - global_net.state_dict()[k].cpu()
+    net_state = net.state_dict()
+    global_state = global_net.state_dict()
+    delta_w = {k: net_state[k] - global_state[k] for k in net_state}
 
     norm = 0
     for k, v in net.named_parameters():
@@ -696,11 +696,11 @@ def train_net_muon(net_id, net, global_net, train_dataloader, test_dataloader, e
             param_name = get_param_name(net, p)
             state = optimizer.state.get(p, None)
             if p.ndim >= 2 and state is not None and 'momentum_buffer' in state:
-                momen_m[param_name] = state['momentum_buffer'].clone().detach().to('cpu')
-    
-    delta_w = {k: v.cpu() for k, v in net.state_dict().items()}
-    for k, v in net.state_dict().items():
-        delta_w[k] = v.cpu() - global_net.state_dict()[k].cpu()
+                momen_m[param_name] = state['momentum_buffer'].clone().detach()
+
+    net_state = net.state_dict()
+    global_state = global_net.state_dict()
+    delta_w = {k: net_state[k] - global_state[k] for k in net_state}
     
     norm = 0
     for k, v in net.named_parameters():
@@ -1195,7 +1195,6 @@ def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./da
     return net_dataidx_map
 
 if __name__ == '__main__':
-    step = torch.tensor([0], dtype=torch.float32, device='cpu')
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
@@ -1206,6 +1205,7 @@ if __name__ == '__main__':
     with open(os.path.join(args.logdir, argument_path), 'w') as f:
         json.dump(str(args), f)
     device = torch.device(args.device)
+    step = torch.tensor([0], dtype=torch.float32, device=device)
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
@@ -1511,12 +1511,10 @@ if __name__ == '__main__':
                 else:
                     m[k] = sum_weights[k] / args.lr
 
-            global_model.to('cpu')
             ps_w = global_model.state_dict()
             for k in sum_weights.keys():
                 ps_w[k] = ps_w[k] + sum_weights[k]
             global_model.load_state_dict(ps_w)
-            global_model.to(device)
 
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
