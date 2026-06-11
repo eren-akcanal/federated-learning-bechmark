@@ -15,6 +15,10 @@ from math import *
 import random
 import json
 
+from optimizer.muon import SingleDeviceMuonWithAuxAdam
+from optimizer.sophia import SophiaG
+
+
 import datetime
 #from torch.utils.tensorboard import SummaryWriter
 
@@ -57,7 +61,7 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
-    parser.add_argument('--K', default=2000, type=int, help='#workers')
+    parser.add_argument('--K', default=1000, type=int, help='#workers')
     parser.add_argument('--alpha', default=0.5, type=float, help=' for mom_step')
     parser.add_argument('--gamma', default=0.2, type=float, help=' for mom_step')
     args = parser.parse_args()
@@ -662,7 +666,118 @@ def train_net_adamw(net_id, net, global_net, train_dataloader, test_dataloader, 
     # Compute accuracy
     train_acc = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    
+    logger.info('>> Training accuracy: {}'.format(train_acc))
+    logger.info('>> Test accuracy: {}'.format(test_acc))
+    logger.info(' ** Training complete **')
 
+    return train_acc, test_acc, delta_w, momen_v
+
+def train_net_sophia(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, momen_m, momen_v, device, step):
+    
+    logger.info('Training network %s with Sophia' % str(net_id))
+
+    train_acc = compute_accuracy(net, train_dataloader, moon_model=False, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, moon_model=False, device=device)
+
+    logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
+    logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+    
+    # Load global weights into local model
+    net.load_state_dict(global_net.state_dict())
+    net.to(device)  
+    
+    # Configure specific parameters for gradients if necessary
+    for name, param in net.named_parameters():
+        if "classifier" in name or "head" in name:
+            param.requires_grad = True
+            
+    # Initialize momen_m if empty
+    if not momen_m:
+        momen_m = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
+    for k in momen_m.keys():
+        momen_m[k] = momen_m[k].to(device)
+        
+    optimizer = SophiaG(net.parameters(), lr=lr * (1 - args.gamma), betas=(0.9, 0.99), rho=0.01, weight_decay=1e-5)
+    
+    # Initialize optimizer state with local trackers
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            if param_name in momen_v:
+                optimizer.state[p]['step'] = step.to(device)
+                optimizer.state[p]['exp_avg'] = torch.zeros_like(p.data).to(device)
+                optimizer.state[p]['hessian'] = momen_v[param_name].clone().detach().to(device)
+                
+    criterion = nn.CrossEntropyLoss().to(device)
+    
+    # Handle dataloader
+    if type(train_dataloader) == type([1]):
+        pass
+    else:
+        train_dataloader = [train_dataloader]
+        
+    step = 0
+    total_loss = 0
+    
+    # Training loop
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for tmp in train_dataloader:
+            for batch_idx, (data, target) in enumerate(tmp):
+                if step >= args.K:
+                    break
+                step += 1
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = net(data)
+                loss = criterion(output, target)
+                total_loss += loss.item() / args.K
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=net.parameters(), max_norm=10)
+                optimizer.step()
+                
+                for n, p in net.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    p.data.add_(momen_m[n].mul(args.gamma * lr / (args.K)))
+                    
+                epoch_loss_collector.append(loss.item())
+                
+        if epoch_loss_collector:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+            logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+            
+    # Extract structural hessian state back to CPU tracking dictionary
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            state = optimizer.state.get(p, None)
+            if state is not None and 'hessian' in state:
+                momen_v[param_name] = state['hessian'].clone().detach().to('cpu')
+                
+    # Compute weight updates delta_w
+    delta_w = {}
+    for k, v in net.state_dict().items():
+        delta_w[k] = v.cpu() - global_net.state_dict()[k].cpu()
+        
+    # Compute norm for logging metrics
+    norm = 0
+    for k, v in net.named_parameters():
+        if k in delta_w:
+            norm += torch.norm(delta_w[k], p=2)
+            
+    # if net_id % 10 == 0:
+    #     logger.info('norm: %f, loss: %f' % (norm, total_loss))
+        
+    # Post-training evaluation
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    
     logger.info('>> Training accuracy: {}'.format(train_acc))
     logger.info('>> Test accuracy: {}'.format(test_acc))
     logger.info(' ** Training complete **')
@@ -694,9 +809,6 @@ def train_net_muon(net_id, net, global_net, train_dataloader, test_dataloader, e
         momen_m = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
     for k in momen_m.keys():
         momen_m[k] = momen_m[k].to(device)
-    
-    # Import muon optimizer (assuming it's available)
-    from optimizer.muon import SingleDeviceMuonWithAuxAdam
     
     # Separate parameters for Muon and Adam
     hidden_weights = [p for p in net.parameters() if p.ndim >= 2]
@@ -974,7 +1086,8 @@ def local_train_net_precond(nets, selected, global_model, args, net_dataidx_map,
             trainacc, testacc, d_i, m_i = train_net_muon(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, ps_c, v, device, step)
         elif alg == 'fedadamw':
             trainacc, testacc, d_i, m_i = train_net_adamw(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, ps_c, v, device, step)
-
+        elif alg == 'fedsophia':
+            trainacc, testacc, d_i, m_i = train_net_sophia(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, ps_c, v, device, step)
         m_list.append(m_i)
         d_list.append(d_i)
         n_i = len(train_dl_local.dataset)
@@ -1096,11 +1209,17 @@ if __name__ == '__main__':
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
+    experiment_path = f"{args.model}/{args.dataset}/{args.partition}"
+    time_id = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S")
     if args.log_file_name is None:
-        argument_path='experiment_arguments-%s.json' % datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S")
+        argument_path='%s_arguments-%s.json' % (args.alg, time_id)
     else:
         argument_path=args.log_file_name+'.json'
-    with open(os.path.join(args.logdir, argument_path), 'w') as f:
+
+    os.makedirs(os.path.join(args.logdir, experiment_path), exist_ok=True)
+
+    argument_path = os.path.join(args.logdir, experiment_path, argument_path)
+    with open(argument_path, 'w') as f:
         json.dump(str(args), f)
     device = torch.device(args.device)
     # logging.basicConfig(filename='test.log', level=logger.info, filemode='w')
@@ -1109,10 +1228,10 @@ if __name__ == '__main__':
         logging.root.removeHandler(handler)
 
     if args.log_file_name is None:
-        args.log_file_name = 'experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S"))
+        args.log_file_name = '%s_log-%s' % (args.alg, time_id)
     log_path=args.log_file_name+'.log'
     logging.basicConfig(
-        filename=os.path.join(args.logdir, log_path),
+        filename=os.path.join(args.logdir, experiment_path, log_path),
         # filename='/home/qinbin/test.log',
         format='%(asctime)s %(levelname)-8s %(message)s',
         datefmt='%m-%d %H:%M', level=logging.DEBUG, filemode='w')
@@ -1120,7 +1239,6 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.info(device)
-    logger.info(json.dumps(vars(args), indent=4))
 
 
     seed = args.init_seed
@@ -1359,7 +1477,7 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
-    elif args.alg in {'fedmuon', 'fedadamw'}:
+    elif args.alg in {'fedmuon', 'fedadamw', 'fedsophia'}:
         logger.info("Initializing nets for FedMuon")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
         global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
