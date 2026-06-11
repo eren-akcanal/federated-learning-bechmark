@@ -30,12 +30,15 @@ DATADIR="./data/"
 LOGDIR="./logs/"
 NOISE=0
 LR=0.01
+PARTITION="noniid-#label2"
+K=1000
 
 # Array of learning rates or seeds you might want to vary (example setup)
 # You can change these arrays to configure your 4 distinct parameters
 LRS=(0.01 0.01 0.05 0.05)
 SEEDS=(0 1 2 3)
-PARTITIONS=("iid-diff-quantity" "cifar10-noniid-labeldir" "mixed" "homo")
+# KS=(50 100 500 1000)
+GAMMAS=(0.3 0.5 0.7 0.9)
 # Run 4 experiments in parallel (one on each GPU)
 for i in {0..3}
 do
@@ -54,12 +57,14 @@ do
         --n_parties=$N_PARTIES \
         --rho=$RHO \
         --comm_round=$COMM_ROUND \
-        --partition=${PARTITIONS[$i]} \
+        --partition=$PARTITION \
         --beta=$BETA \
         --device="cuda:$GPU_INDEX" \
         --datadir=$DATADIR \
         --logdir=$LOGDIR \
         --noise=$NOISE \
+        --K=$K \
+        --gamma=${GAMMAS[$i]} \
         --init_seed=0 & 
 
     sleep 61

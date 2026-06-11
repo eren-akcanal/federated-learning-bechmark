@@ -59,7 +59,7 @@ def get_args():
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
     parser.add_argument('--K', default=2000, type=int, help='#workers')
     parser.add_argument('--alpha', default=0.5, type=float, help=' for mom_step')
-    parser.add_argument('--gamma', default=0.0, type=float, help=' for mom_step')
+    parser.add_argument('--gamma', default=0.2, type=float, help=' for mom_step')
     args = parser.parse_args()
     return args
 
@@ -749,7 +749,7 @@ def train_net_muon(net_id, net, global_net, train_dataloader, test_dataloader, e
                 for n, p in net.named_parameters():
                     if not p.requires_grad:
                         continue
-                    # p.data.add_(ps_c[n].mul(args.gamma * lr / (args.K)))
+                    p.data.add_(ps_c[n].mul(args.gamma * lr / (args.K)))
                 
                 epoch_loss_collector.append(loss.item())
         
