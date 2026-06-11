@@ -744,6 +744,42 @@ def _pool_size(num_workers_arg: int, n_selected: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Helper: re-wrap a DataLoader to use num_workers=0 (in-process loading).
+#
+# WHY THIS IS NEEDED:
+#   When multiple ThreadPoolExecutor threads each hold a DataLoader that
+#   itself spawns worker *subprocesses* (num_workers > 0), each subprocess
+#   tries to allocate a shared-memory segment under /dev/shm.  Running N
+#   parallel threads × M dataloader workers quickly exhausts the kernel's
+#   shm limit, producing:
+#       RuntimeError: unable to allocate shared memory for file </torch_…>
+#
+#   The fix is to force every DataLoader used *inside* a thread to do its
+#   data fetching in-process (num_workers=0).  There is no shared memory
+#   involved, the GIL is irrelevant here (data loading is I/O-bound or
+#   already in RAM), and the GPU stays the actual bottleneck anyway.
+# ---------------------------------------------------------------------------
+def _wrap_loader_for_thread(dl: data.DataLoader) -> data.DataLoader:
+    """
+    Return a new DataLoader backed by the same dataset/sampler as `dl` but
+    with num_workers=0 and pin_memory=False, safe for use inside threads.
+
+    If `dl` already has num_workers=0 it is returned unchanged.
+    """
+    if dl.num_workers == 0:
+        return dl
+    return data.DataLoader(
+        dataset=dl.dataset,
+        batch_size=dl.batch_size,
+        sampler=dl.sampler,
+        collate_fn=dl.collate_fn,
+        drop_last=dl.drop_last,
+        num_workers=0,       # ← no subprocess workers: no shm allocation
+        pin_memory=False,    # ← pin_memory also requires subprocess workers
+    )
+
+
+# ---------------------------------------------------------------------------
 # local_train_net  (fedavg / local_training / all_in)
 # ---------------------------------------------------------------------------
 def local_train_net(nets, selected, args, net_dataidx_map, test_dl=None,
@@ -770,6 +806,7 @@ def local_train_net(nets, selected, args, net_dataidx_map, test_dl=None,
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl,
                                       args.epochs, args.lr, args.optimizer, device=device)
         logger.info("net %d final test acc %f" % (net_id, testacc))
@@ -821,6 +858,7 @@ def local_train_net_fedprox(nets, selected, global_model, args, net_dataidx_map,
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         trainacc, testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl,
                                               args.epochs, args.lr, args.optimizer, args.mu, device=device)
         logger.info("net %d final test acc %f" % (net_id, testacc))
@@ -881,6 +919,7 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         trainacc, testacc, c_delta_para = train_net_scaffold(
             net_id, net, global_model, c_nets[net_id], c_global,
             train_dl_local, test_dl, args.epochs, args.lr, args.optimizer, device=device)
@@ -970,6 +1009,7 @@ def local_train_net_precond(nets, selected, global_model, args, net_dataidx_map,
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         n_epoch = args.epochs
 
         client_v    = _get_client_v(net_id)
@@ -1053,6 +1093,7 @@ def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map,
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         trainacc, testacc, a_i, d_i = train_net_fednova(net_id, net, global_model, train_dl_local, test_dl,
                                                          args.epochs, args.lr, args.optimizer, device=device)
         n_i = len(train_dl_local.dataset)
@@ -1115,6 +1156,7 @@ def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None,
                 noise_level = args.noise / (args.n_parties - 1) * net_id
                 train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32,
                                                          dataidxs, noise_level)
+        train_dl_local = _wrap_loader_for_thread(train_dl_local)
         prev_models = [prev_model_pool[i][net_id] for i in range(len(prev_model_pool))]
         trainacc, testacc = train_net_moon(net_id, net, global_model, prev_models,
                                            train_dl_local, test_dl, args.epochs, args.lr,
