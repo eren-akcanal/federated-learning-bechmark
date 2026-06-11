@@ -13,6 +13,7 @@ import os
 import copy
 from math import *
 import random
+import json
 
 import datetime
 #from torch.utils.tensorboard import SummaryWriter
@@ -56,25 +57,11 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
-    parser.add_argument('--K', default=10, type=int, help='#workers')
+    parser.add_argument('--K', default=2000, type=int, help='#workers')
+    parser.add_argument('--alpha', default=0.5, type=float, help=' for mom_step')
+    parser.add_argument('--gamma', default=0.0, type=float, help=' for mom_step')
     args = parser.parse_args()
     return args
-
-def _flatten_for_svd(x: torch.Tensor):
-    """muon 风格展平：4D conv -> [out, -1]；2D 保持；其他 >=3D -> [dim0, -1]。"""
-    orig_shape = tuple(x.shape)
-    if x.ndim == 2:
-        mat = x
-    elif x.ndim == 4:
-        mat = x.reshape(orig_shape[0], -1)
-    else:  # 兼容 3D/5D 等少见情况
-        mat = x.reshape(orig_shape[0], -1)
-    return mat, orig_shape
-
-def _unflatten_from_svd(mat2d: torch.Tensor, orig_shape: tuple):
-    """按保存的原形状还原（展平规则都是 [dim0, -1]，因此直接 reshape 回去即可）。"""
-    return mat2d.reshape(orig_shape)
-
 
 def init_nets(net_configs, dropout_p, n_parties, args):
 
@@ -181,6 +168,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
                                amsgrad=True)
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=args.rho, weight_decay=args.reg)
+    # elif 
     criterion = nn.CrossEntropyLoss().to(device)
 
     cnt = 0
@@ -568,6 +556,247 @@ def train_net_moon(net_id, net, global_net, previous_nets, train_dataloader, tes
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
+def train_net_adamw(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, momen_m, momen_v, device, step):
+
+    logger.info('Training network %s with AdamW' % str(net_id))
+
+    train_acc = compute_accuracy(net, train_dataloader, moon_model=False, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, moon_model=False, device=device)
+
+    logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
+    logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+
+    # Load global weights into local model
+    net.load_state_dict(global_net.state_dict())
+    net.to(device)
+
+    # Initialize momen_m if empty
+    if not momen_m:
+        momen_m = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
+    for k in momen_m.keys():
+        momen_m[k] = momen_m[k].to(device)
+
+    # Initialize momen_v if empty
+    if not momen_v:
+        momen_v = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
+    for k in momen_v.keys():
+        momen_v[k] = momen_v[k].to(device)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, net.parameters()),
+        lr=lr,
+        weight_decay=0.01,
+        amsgrad=False
+    )
+
+    # Restore optimizer state from momen_v and step
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            optimizer.state[p]['step'] = step.to(device)
+            optimizer.state[p]['exp_avg'] = torch.zeros_like(p.data).to(device)
+            optimizer.state[p]['exp_avg_sq'] = momen_v[param_name].clone().detach().to(device)
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    # Handle dataloader
+    if type(train_dataloader) == type([1]):
+        pass
+    else:
+        train_dataloader = [train_dataloader]
+
+    step = 0
+    total_loss = 0
+
+    # Training loop
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for tmp in train_dataloader:
+            for batch_idx, (data, target) in enumerate(tmp):
+                if step >= args.K:
+                    break
+                step += 1
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = net(data)
+                loss = criterion(output, target)
+                total_loss += loss.item() / args.K
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=net.parameters(), max_norm=10)
+                optimizer.step()
+                for n, p in net.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    p.data.add_(momen_m[n].mul(args.gamma * lr / (args.K)))
+
+                epoch_loss_collector.append(loss.item())
+
+        if epoch_loss_collector:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+            logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            state = optimizer.state.get(p, None)
+            if state is not None and 'exp_avg_sq' in state:
+                momen_v[param_name] = state['exp_avg_sq'].clone().detach().to('cpu')
+
+    delta_w = {k: v.cpu() for k, v in net.state_dict().items()}
+    for k, v in net.state_dict().items():
+        delta_w[k] = v.cpu() - global_net.state_dict()[k].cpu()
+
+    # Compute norm for logging
+    norm = 0
+    for k, v in net.named_parameters():
+        if k in delta_w:
+            norm += torch.norm(delta_w[k], p=2)
+
+    if net_id % 10 == 0:
+        logger.info('norm: %f, loss: %f' % (norm, total_loss))
+
+    # Compute accuracy
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+    logger.info('>> Training accuracy: {}'.format(train_acc))
+    logger.info('>> Test accuracy: {}'.format(test_acc))
+    logger.info(' ** Training complete **')
+
+    return train_acc, test_acc, delta_w, momen_v
+
+def train_net_muon(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, ps_c, momen_m, device, step):
+    
+    logger.info('Training network %s with Muon' % str(net_id))
+
+    train_acc = compute_accuracy(net, train_dataloader, moon_model=False, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, moon_model=False, device=device)
+
+    logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
+    logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+    
+    # Load global weights into local model
+    net.load_state_dict(global_net.state_dict())
+    net.to(device)
+    
+    # Initialize ps_c if empty
+    if not ps_c:
+        ps_c = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
+    for k in ps_c.keys():
+        ps_c[k] = ps_c[k].to(device)
+    
+    # Initialize momen_m if empty
+    if not momen_m:
+        momen_m = {k: torch.zeros_like(v) for k, v in net.state_dict().items()}
+    for k in momen_m.keys():
+        momen_m[k] = momen_m[k].to(device)
+    
+    # Import muon optimizer (assuming it's available)
+    from optimizer.muon import SingleDeviceMuonWithAuxAdam
+    
+    # Separate parameters for Muon and Adam
+    hidden_weights = [p for p in net.parameters() if p.ndim >= 2]
+    hidden_gains_biases = [p for p in net.parameters() if p.ndim < 2]
+    nonhidden_params = []
+    
+    param_groups = [
+        dict(params=hidden_weights, use_muon=True,
+             lr=lr * args.alpha * (1 - args.gamma), weight_decay=0.01, momentum=0.95),
+        dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
+             lr=lr * (1 - args.gamma), betas=(0.9, 0.95), weight_decay=0.01),
+    ]
+    
+    optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            if p.ndim >= 2 and param_name in momen_m:
+                optimizer.state[p]['momentum_buffer'] = momen_m[param_name].clone().detach().to(device)
+    
+    criterion = nn.CrossEntropyLoss().to(device)
+    
+    # Handle dataloader
+    if type(train_dataloader) == type([1]):
+        pass
+    else:
+        train_dataloader = [train_dataloader]
+    
+    step = 0
+    total_loss = 0
+    
+    # Training loop
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for tmp in train_dataloader:
+            for batch_idx, (data, target) in enumerate(tmp):
+                if step >= args.K:
+                    break
+                step += 1
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = net(data)
+                loss = criterion(output, target)
+                total_loss += loss.item() / args.K
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=net.parameters(), max_norm=1)
+                optimizer.step()
+                for n, p in net.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    # p.data.add_(ps_c[n].mul(args.gamma * lr / (args.K)))
+                
+                epoch_loss_collector.append(loss.item())
+        
+        if epoch_loss_collector:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+            logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+    
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            param_name = get_param_name(net, p)
+            state = optimizer.state.get(p, None)
+            if p.ndim >= 2 and state is not None and 'momentum_buffer' in state:
+                momen_m[param_name] = state['momentum_buffer'].clone().detach().to('cpu')
+    
+    delta_w = {k: v.cpu() for k, v in net.state_dict().items()}
+    for k, v in net.state_dict().items():
+        delta_w[k] = v.cpu() - global_net.state_dict()[k].cpu()
+    
+    # Compute norm for logging
+    norm = 0
+    for k, v in net.named_parameters():
+        if k in delta_w:
+            norm += torch.norm(delta_w[k], p=2)
+    
+    # if net_id % 10 == 0:
+    #     logger.info('norm: %f, loss: %f' % (norm, total_loss))
+    
+    # Compute accuracy
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    
+    logger.info('>> Training accuracy: {}'.format(train_acc))
+    logger.info('>> Test accuracy: {}'.format(test_acc))
+    logger.info(' ** Training complete **')
+    
+    return train_acc, test_acc, delta_w, momen_m
+
+
+def get_param_name(net, param):
+    """Helper function to get parameter name from parameter object"""
+    for name, p in net.named_parameters():
+        if p is param:
+            return name
+    return None
+    
 
 def view_image(train_dataloader):
     for (x, target) in train_dataloader:
@@ -712,75 +941,55 @@ def local_train_net_scaffold(nets, selected, global_model, c_nets, c_global, arg
     nets_list = list(nets.values())
     return nets_list
 
-def local_train_net_fedmuon(nets, selected, args, device="cpu", train_dl_cache=None):
-    """
-    Sequentially trains selected local models and returns weight changes (delta_w).
-    Matches the pattern used by FedNova's local training handler.
-    """
-    delta_list = []
-    criterion = torch.nn.CrossEntropyLoss()
+def local_train_net_precond(nets, selected, global_model, args, net_dataidx_map, ps_c, v, alg, test_dl=None, device="cpu", train_dl_cache=None, step=None):
+    avg_acc = 0.0
 
-    for idx in selected:
-        model = nets[idx]
-        model.to(device)
-        
-        # Ensure head parameters are explicit training targets
-        for name, param in model.named_parameters():
-            if "classifier" in name or "head" in name:
-                param.requires_grad = True
+    m_list = []
+    d_list = []
+    n_list = []
+    global_model.to(device)
+    for net_id, net in nets.items():
+        if net_id not in selected:
+            continue
+        dataidxs = net_dataidx_map[net_id]
 
-        # Track the starting weights of the round to isolate delta paths later
-        starting_weights = copy.deepcopy(model.state_dict())
-        
-        # Pull specific DataLoader for this target node
-        train_dataloader = train_dl_cache[idx]
-        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=1e-3)
-        
-        step = 0
-        local_loss = 0.0
-        model.train()
+        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
+        net.to(device)
 
-        # Run local optimization iterations
-        for e in range(args.epochs):
-            for batch_idx, (data, target) in enumerate(train_dataloader):
-                if step >= args.K:
-                    break
-                step += 1
-                
-                data, target = data.to(device), target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                loss = criterion(output, target)
-                local_loss += loss.item() / args.K
-                
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=10)
-                optimizer.step()
-            if step >= args.K:
-                break
-
-        # Calculate weight updates: delta_w = w_t_local - w_t_global
-        current_weights = model.state_dict()
-        delta_w = {}
-        
-        if hasattr(args, 'lora') and args.lora == 1:
-            for k, v in current_weights.items():
-                if 'lora' in k or "classifier" in k or "head" in k:
-                    delta_w[k] = v.detach().cpu() - starting_weights[k].cpu()
+        if train_dl_cache is not None:
+            # reuse the pre-built DataLoader — avoids recreating it every round
+            train_dl_local = train_dl_cache[net_id]
         else:
-            for k, v in current_weights.items():
-                delta_w[k] = v.detach().cpu() - starting_weights[k].cpu()
+            noise_level = args.noise
+            if net_id == args.n_parties - 1:
+                noise_level = 0
+            if args.noise_type == 'space':
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+            else:
+                noise_level = args.noise / (args.n_parties - 1) * net_id
+                train_dl_local, _, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+        n_epoch = args.epochs
 
-        # Compute trace updates metrics
-        norm = sum(torch.norm(delta_w[k], p=2) for k in delta_w).item()
-        logger.info(f"Client {idx} -> Steps: {step} | Update Norm: {norm:.4f} | Local Avg Loss: {local_loss:.4f}")
-        
-        delta_list.append(delta_w)
-        
-        # Push model back to cpu memory to safely handle footprints
-        model.to("cpu")
-        
-    return delta_list
+        if alg == 'fedmuon':
+            trainacc, testacc, d_i, m_i = train_net_muon(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, ps_c, v, device, step)
+        elif alg == 'fedadamw':
+            trainacc, testacc, d_i, m_i = train_net_adamw(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, ps_c, v, device, step)
+
+        m_list.append(m_i)
+        d_list.append(d_i)
+        n_i = len(train_dl_local.dataset)
+        n_list.append(n_i)
+        logger.info("net %d final test acc %f" % (net_id, testacc))
+        avg_acc += testacc
+
+
+    avg_acc /= len(selected)
+    if args.alg == 'local_training':
+        logger.info("avg test acc %f" % avg_acc)
+
+    nets_list = list(nets.values())
+    return nets_list, m_list, d_list, n_list
+
 
 def local_train_net_fednova(nets, selected, global_model, args, net_dataidx_map, test_dl=None, device="cpu", train_dl_cache=None):
     avg_acc = 0.0
@@ -883,6 +1092,7 @@ def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./da
 
 if __name__ == '__main__':
     # torch.set_printoptions(profile="full")
+    step = torch.tensor([0], dtype=torch.float32, device='cpu')
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
@@ -910,6 +1120,8 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.info(device)
+    logger.info(json.dumps(vars(args), indent=4))
+
 
     seed = args.init_seed
     logger.info("#" * 100)
@@ -1147,19 +1359,23 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
-    elif args.alg == 'fedmuon':
+    elif args.alg in {'fedmuon', 'fedadamw'}:
         logger.info("Initializing nets for FedMuon")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
         global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
         global_model = global_models[0]
 
-        # Sync initial weights if selected
-        global_para = global_model.state_dict()
-        if args.is_same_initial:
-            for net_id, net in nets.items():
-                net.load_state_dict(global_para)
+        d_list = [copy.deepcopy(global_model.state_dict()) for i in range(args.n_parties)]
+        d_total_round = copy.deepcopy(global_model.state_dict())
+        for i in range(args.n_parties):
+            for key in d_list[i]:
+                d_list[i][key] = 0
+        for key in d_total_round:
+            d_total_round[key] = 0
 
-        # Loop over communication rounds
+        m = {} 
+        v = {}
+
         for round in range(args.comm_round):
             logger.info("in comm round:" + str(round))
 
@@ -1167,50 +1383,69 @@ if __name__ == '__main__':
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
-            # Broadcast global weights to chosen participants
             global_para = global_model.state_dict()
-            for idx in selected:
-                nets[idx].load_state_dict(global_para)
+            if round == 0:
+                if args.is_same_initial:
+                    for idx in selected:
+                        nets[idx].load_state_dict(global_para)
+            else:
+                for idx in selected:
+                    nets[idx].load_state_dict(global_para)
 
-            # --- Local Training Phase (Sequential Local Loop) ---
-            # This calls the custom local training function designed below
-            delta_list = local_train_net_fedmuon(nets, selected, args, device=device, train_dl_cache=client_train_loaders)
-
-            # --- Server Aggregation & Muon SVD Treatment ---
-            updated_model = global_model.state_dict()
+            # 1. Run local training
+            _, m_list, d_list, n_list = local_train_net_precond(
+                nets, selected, global_model, args, net_dataidx_map, 
+                ps_c=m, v=v, alg=args.alg, test_dl=test_dl_global, device=device, 
+                train_dl_cache=client_train_loaders, step = step
+            )
             
-            # 1. Accumulate averaged raw pseudo-gradients (delta_w) across clients
-            avg_delta = {key: torch.zeros_like(updated_model[key], dtype=torch.float32, device=device) for key in updated_model}
+            # Number of active clients in this round
+            n_selected = len(selected)
             
-            for delta_w in delta_list:
-                for key in delta_w:
-                    avg_delta[key] += delta_w[key].to(device) / len(selected)
+            # 2. Aggregate client momentum vectors (momen_v)
+            momen_v = {}
+            if len(m_list) > 0:
+                for k, val in m_list[0].items():
+                    momen_v[k] = val / n_selected
 
-            # 2. Apply Server-Side Muon Orthogonalization
-            with torch.no_grad():
-                for key in updated_model.keys():
-                    target_device = updated_model[key].device
+                for ci in m_list[1:]:
+                    for k, val in ci.items():
+                        momen_v[k] += val / n_selected
+            
+            # Update the global tracking dictionary v with the aggregated momentum
+            v.update(momen_v)
+
+            # 3. Aggregate model updates / weights from d_list_selected
+            sum_weights = {}
+            if len(d_list) > 0:
+                for k, val in d_list[0].items():
+                    sum_weights[k] = val / n_selected
                     
-                    if avg_delta[key].ndim in [2, 4] and "weight" in key:
-                        mat, orig_shape = _flatten_for_svd(avg_delta[key])
-                        
-                        try:
-                            # Singular Value Decomposition: mat = U * S * V^T
-                            U, S, Vt = torch.linalg.svd(mat, full_matrices=False)
-                            ortho_mat = U @ Vt
-                            ortho_delta = _unflatten_from_svd(ortho_mat, orig_shape)
-                            
-                            updated_model[key] += args.lg * ortho_delta.to(target_device)
-                        except RuntimeError:
-                            updated_model[key] += args.lg * avg_delta[key].to(target_device)
-                    else:
-                        updated_model[key] += args.lg * avg_delta[key].to(target_device)
+                for weight in d_list[1:]:
+                    for k, val in weight.items():
+                        sum_weights[k] += val / n_selected
 
-            global_model.load_state_dict(updated_model)
-            global_model.to(device)
+            # 4. Update the global optimizer state tracker (m) using sum_weights
+            for k, val in sum_weights.items():
+                if k not in m.keys():
+                    m[k] = sum_weights[k] / args.lr
+                else:
+                    m[k] = sum_weights[k] / args.lr
+                    # m[k] = args.alpha * m[k] + (1 - args.alpha) * sum_weights[k] / args.lr # alternative momentum tracking
+
+            # 5. Apply aggregated updates to the global model parameters
+            global_model.to('cpu')
+            ps_w = global_model.state_dict()
+            for k in sum_weights.keys():
+                ps_w[k] = ps_w[k] + sum_weights[k]
             
+            global_model.load_state_dict(ps_w)
+            global_model.to(device)
+
+            # 6. Global Model Tracking and Verification
             logger.info('global n_training: %d' % len(train_dl_global))
             logger.info('global n_test: %d' % len(test_dl_global))
+
             train_acc = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
 
