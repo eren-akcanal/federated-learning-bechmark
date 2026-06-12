@@ -744,23 +744,24 @@ class FEMNIST(MNIST):
 
 class Generated(MNIST):
 
-    def __init__(self, root, dataidxs=None, train=True, transform=None, target_transform=None,
+    def __init__(self, root, dataset, dataidxs=None, train=True, transform=None, target_transform=None,
                  download=False):
+        # Explicitly pass root and transforms to the super constructor
         super(MNIST, self).__init__(root, transform=transform,
                                     target_transform=target_transform)
         self.train = train
         self.dataidxs = dataidxs
+        self.dataset = dataset
+
+        # Dynamically point to the isolated dataset folder
+        target_dir = f"data/generated_{dataset}/"
 
         if self.train:
-            self.data = np.load("data/generated/X_train.npy")
-            self.targets = np.load("data/generated/y_train.npy")
+            self.data = np.load(os.path.join(target_dir, "X_train.npy"))
+            self.targets = np.load(os.path.join(target_dir, "y_train.npy"))
         else:
-            self.data = np.load("data/generated/X_test.npy")
-            self.targets = np.load("data/generated/y_test.npy")            
-
-        if self.dataidxs is not None:
-            self.data = self.data[self.dataidxs]
-            self.targets = self.targets[self.dataidxs]        
+            self.data = np.load(os.path.join(target_dir, "X_test.npy"))
+            self.targets = np.load(os.path.join(target_dir, "y_test.npy"))  
 
 
     def __getitem__(self, index):

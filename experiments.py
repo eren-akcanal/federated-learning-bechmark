@@ -187,7 +187,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
         epoch_loss_collector = []
         for tmp in train_dataloader:
             for batch_idx, (x, target) in enumerate(tmp):
-                x, target = x.to(device), target.to(device)
+                x, target = x.to(device), target.to(device).long()
 
                 optimizer.zero_grad()
                 x.requires_grad = True
@@ -261,7 +261,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
     for epoch in range(epochs):
         epoch_loss_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.to(device), target.to(device)
+            x, target = x.to(device), target.to(device).long()
 
             optimizer.zero_grad()
             x.requires_grad = True
@@ -341,7 +341,7 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
         epoch_loss_collector = []
         for tmp in train_dataloader:
             for batch_idx, (x, target) in enumerate(tmp):
-                x, target = x.to(device), target.to(device)
+                x, target = x.to(device), target.to(device).long()
 
                 optimizer.zero_grad()
                 x.requires_grad = True
@@ -412,7 +412,7 @@ def train_net_fednova(net_id, net, global_model, train_dataloader, test_dataload
         epoch_loss_collector = []
         for tmp in train_dataloader:
             for batch_idx, (x, target) in enumerate(tmp):
-                x, target = x.to(device), target.to(device)
+                x, target = x.to(device), target.to(device).long()
 
                 optimizer.zero_grad()
                 x.requires_grad = True
@@ -498,7 +498,7 @@ def train_net_moon(net_id, net, global_net, previous_nets, train_dataloader, tes
         epoch_loss1_collector = []
         epoch_loss2_collector = []
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.to(device), target.to(device)
+            x, target = x.to(device), target.to(device).long()
             if target.shape[0] == 1:
                 continue
 
@@ -622,7 +622,7 @@ def train_net_adamw(net_id, net, global_net, train_dataloader, test_dataloader, 
                 if step >= args.K:
                     break
                 step += 1
-                data, target = data.to(device), target.to(device)
+                data, target = data.to(device), target.to(device).long()
                 optimizer.zero_grad()
                 output = net(data)
                 loss = criterion(output, target)
@@ -730,7 +730,7 @@ def train_net_sophia(net_id, net, global_net, train_dataloader, test_dataloader,
                 if step >= args.K:
                     break
                 step += 1
-                data, target = data.to(device), target.to(device)
+                data, target = data.to(device), target.to(device).long()
                 optimizer.zero_grad()
                 output = net(data)
                 loss = criterion(output, target)
@@ -850,7 +850,7 @@ def train_net_muon(net_id, net, global_net, train_dataloader, test_dataloader, e
                 if step >= args.K:
                     break
                 step += 1
-                data, target = data.to(device), target.to(device)
+                data, target = data.to(device), target.to(device).long()
                 optimizer.zero_grad()
                 output = net(data)
                 loss = criterion(output, target)
