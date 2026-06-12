@@ -14,6 +14,7 @@ import copy
 from model import *
 from datasets import MNIST_truncated, CIFAR10_truncated, CIFAR100_truncated, ImageFolder_custom, SVHN_custom, FashionMNIST_truncated, CustomTensorDataset, CelebA_custom, FEMNIST, Generated, genData
 from math import sqrt
+from sklearn.datasets import fetch_openml, fetch_rcv1, fetch_covtype, dump_svmlight_file
 
 import torch.nn as nn
 
@@ -250,7 +251,73 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
     #    np.save("data/generated/y_train.npy",y_train)
     #    np.save("data/generated/y_test.npy",y_test)
 
-    elif dataset in ('rcv1', 'SUSY', 'covtype'):
+    elif dataset in ('SUSY', 'covtype'):
+        mkdirs(datadir)
+        
+        # Determine the target file paths that your code expects
+        if dataset == 'a9a':
+            train_file = os.path.join(datadir, "a9a")
+            test_file = os.path.join(datadir, "a9a.t")
+        else:
+            train_file = os.path.join(datadir, dataset)
+            test_file = None
+
+        # --- AUTOMATIC DOWNLOAD & FORMATTING IF MISSING ---
+        if not os.path.exists(train_file):
+            logger.info(f"Dataset file missing. Downloading and generating LibSVM file for {dataset}...")
+            
+            if dataset == 'a9a':
+                # Fetch adult/a9a from OpenML
+                data_dict_train = fetch_openml(name='adult', version=2, as_frame=False, parser='auto')
+                X_all, y_all = data_dict_train.data, data_dict_train.target
+                if y_all.dtype.kind in ('O', 'U'):
+                    _, y_all = np.unique(y_all, return_inverse=True)
+                y_all = y_all * 2 - 1  # Convert 0/1 to LibSVM standard -1/+1
+                
+                # Recreate the train/test split matching a9a and a9a.t proportions
+                from sklearn.model_selection import train_test_split
+                X_d_train, X_d_test, y_d_train, y_d_test = train_test_split(
+                    X_all, y_all, test_size=0.33, random_state=42
+                )
+                
+                # Dump them to the exact file paths your script looks for
+                import scipy.sparse as sp
+                if not sp.issparse(X_d_train): X_d_train = sp.csr_matrix(X_d_train)
+                if not sp.issparse(X_d_test): X_d_test = sp.csr_matrix(X_d_test)
+                dump_svmlight_file(X_d_train, y_d_train, train_file)
+                dump_svmlight_file(X_d_test, y_d_test, test_file)
+
+            elif dataset == 'rcv1':
+                train_file = os.path.join(datadir, 'rcv1_train.binary')
+                test_file = os.path.join(datadir, 'rcv1_test.binary')
+
+                if not os.path.exists(train_file) or not os.path.exists(test_file):
+                    raise FileNotFoundError(
+                        f"Manual RCV1 files missing! Please ensure both files exist:\n"
+                        f"1. {train_file}\n2. {test_file}"
+                    )
+                
+                # logger.info("Loading RCV1 directly from manual local files...")
+                # # Load training and test sets enforcing exactly 47236 dimensions
+                # X_d_train, y_d_train = load_svmlight_file(train_file, n_features=47236)
+                # X_d_test, y_d_test = load_svmlight_file(test_file, n_features=47236)
+
+                # # Convert sparse structures to dense numpy arrays safely
+                # X_d_train = np.array(X_d_train.todense(), dtype=np.float32)
+                # X_d_test = np.array(X_d_test.todense(), dtype=np.float32)
+
+                # # Stack them into the global matrix pool for client allocation
+                # X_train_all = np.vstack((X_d_train, X_d_test))
+                # y_train_all = np.concatenate((y_d_train, y_d_test))
+            elif dataset == 'covtype':
+                # Automatically downloads and caches covtype
+                covtype = fetch_covtype()
+                X_cov, y_cov = covtype.data, covtype.target
+                import scipy.sparse as sp
+                X_cov = sp.csr_matrix(X_cov)
+                dump_svmlight_file(X_cov, y_cov, train_file)
+                
+            logger.info(f"Successfully created localized SVMLight files in {datadir}")
         X_train, y_train = load_svmlight_file(datadir+dataset)
         X_train = X_train.todense()
         num_train = int(X_train.shape[0] * 0.75)
@@ -265,15 +332,72 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
         X_train = np.array(X_train[idxs[:num_train]], dtype=np.float32)
         y_train = np.array(y_train[idxs[:num_train]], dtype=np.int32)
 
-        mkdirs("data/generated/")
-        np.save("data/generated/X_train.npy",X_train)
-        np.save("data/generated/X_test.npy",X_test)
-        np.save("data/generated/y_train.npy",y_train)
-        np.save("data/generated/y_test.npy",y_test)
+        target_dir = f"data/generated_{dataset}/"
+        mkdirs(target_dir)
+        np.save(os.path.join(target_dir, "X_train.npy"), X_train)
+        np.save(os.path.join(target_dir, "X_test.npy"), X_test)
+        np.save(os.path.join(target_dir, "y_train.npy"), y_train)
+        np.save(os.path.join(target_dir, "y_test.npy"), y_test)
 
-    elif dataset in ('a9a'):
-        X_train, y_train = load_svmlight_file(datadir+"a9a")
-        X_test, y_test = load_svmlight_file(datadir+"a9a.t")
+    elif dataset in ('a9a', 'rcv1'):
+        mkdirs(datadir)
+        
+        # Determine the target file paths that your code expects
+        if dataset == 'a9a':
+            train_file = os.path.join(datadir, "a9a")
+            test_file = os.path.join(datadir, "a9a.t")
+        else:
+            train_file = os.path.join(datadir, dataset)
+            test_file = None
+
+        # --- AUTOMATIC DOWNLOAD & FORMATTING IF MISSING ---
+        if not os.path.exists(train_file):
+            logger.info(f"Dataset file missing. Downloading and generating LibSVM file for {dataset}...")
+            
+            if dataset == 'a9a':
+                import urllib.request
+                import scipy.sparse as sp
+
+                # Official URLs for the LIBSVM formatted a9a dataset
+                url_train = "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/a9a"
+                url_test = "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/a9a.t"
+
+                logger.info("Downloading official LIBSVM format a9a files...")
+                
+                # Download directly to the paths your script expects
+                urllib.request.urlretrieve(url_train, train_file)
+                urllib.request.urlretrieve(url_test, test_file)
+
+                logger.info("Verifying shapes from downloaded LIBSVM files...")
+                
+                # Load them back to explicitly guarantee they conform to exactly 123 features
+                X_d_train, y_d_train = load_svmlight_file(train_file, n_features=123)
+                X_d_test, y_d_test = load_svmlight_file(test_file, n_features=123)
+
+                # Save them back out via dump to ensure formatting is fully localized and clean
+                dump_svmlight_file(X_d_train, y_d_train, train_file)
+                dump_svmlight_file(X_d_test, y_d_test, test_file)
+                
+                logger.info(f"Successfully generated standard a9a files with shapes: Train {X_d_train.shape}, Test {X_d_test.shape}")
+
+            elif dataset == 'rcv1':
+                train_file = os.path.join(datadir, 'rcv1_train.binary')
+                test_file = os.path.join(datadir, 'rcv1_test.binary')
+            elif dataset == 'covtype':
+                # Automatically downloads and caches covtype
+                covtype = fetch_covtype()
+                X_cov, y_cov = covtype.data, covtype.target
+                import scipy.sparse as sp
+                X_cov = sp.csr_matrix(X_cov)
+                dump_svmlight_file(X_cov, y_cov, train_file)
+                
+            logger.info(f"Successfully created localized SVMLight files in {datadir}")
+        if dataset == 'a9a':
+            X_train, y_train = load_svmlight_file(datadir+"a9a")
+            X_test, y_test = load_svmlight_file(datadir+"a9a.t")
+        elif dataset == 'rcv1':
+            X_train, y_train = load_svmlight_file(train_file, n_features=47236)
+            X_test, y_test = load_svmlight_file(test_file, n_features=47236)
         X_train = X_train.todense()
         X_test = X_test.todense()
         X_test = np.c_[X_test, np.zeros((len(y_test), X_train.shape[1] - np.size(X_test[0, :])))]
@@ -285,11 +409,12 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
         y_train = np.array(y_train, dtype=np.int32)
         y_test = np.array(y_test, dtype=np.int32)
 
-        mkdirs("data/generated/")
-        np.save("data/generated/X_train.npy",X_train)
-        np.save("data/generated/X_test.npy",X_test)
-        np.save("data/generated/y_train.npy",y_train)
-        np.save("data/generated/y_test.npy",y_test)
+        target_dir = f"data/generated_{dataset}/"
+        mkdirs(target_dir)
+        np.save(os.path.join(target_dir, "X_train.npy"), X_train)
+        np.save(os.path.join(target_dir, "X_test.npy"), X_test)
+        np.save(os.path.join(target_dir, "y_train.npy"), y_train)
+        np.save(os.path.join(target_dir, "y_test.npy"), y_test)
 
 
     n_train = y_train.shape[0]
@@ -669,6 +794,7 @@ class AddGaussianNoise(object):
 
 def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_level=0, net_id=None, total=0):
     if dataset in ('mnist', 'femnist', 'fmnist', 'cifar10', 'svhn', 'generated', 'covtype', 'a9a', 'rcv1', 'SUSY', 'cifar100', 'tinyimagenet'):
+        a = False
         if dataset == 'mnist':
             dl_obj = MNIST_truncated
 
@@ -767,17 +893,20 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             ])
 
         else:
+            a = True
             dl_obj = Generated
             transform_train = None
             transform_test = None
+            train_ds = dl_obj(datadir+'./train/', dataset=dataset, dataidxs=dataidxs, transform=transform_train)
+            test_ds = dl_obj(datadir+'./val/', dataset=dataset, transform=transform_test)
 
-
-        if dataset == "tinyimagenet":
-            train_ds = dl_obj(datadir+'./train/', dataidxs=dataidxs, transform=transform_train)
-            test_ds = dl_obj(datadir+'./val/', transform=transform_test)
-        else:
-            train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
-            test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+        if a == False:
+            if dataset == "tinyimagenet":
+                train_ds = dl_obj(datadir+'./train/', dataidxs=dataidxs, transform=transform_train)
+                test_ds = dl_obj(datadir+'./val/', transform=transform_test)
+            else:
+                train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
+                test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
 
         # num_workers=4: async CPU prefetch overlaps data loading with GPU compute
         # pin_memory=True: DMA-pinned staging buffer for faster PCIe transfers
